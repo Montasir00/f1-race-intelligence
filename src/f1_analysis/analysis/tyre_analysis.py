@@ -1,65 +1,28 @@
-"""Tyre degradation and compound analysis module for F1 Race Intelligence.
+"""Module B - tyre degradation.
 
-Applies linear regression (OLS via NumPy / SciPy) to quantify lap-time degradation rates
-per lap of tyre age across compounds (Soft, Medium, Hard), accounting for fuel load burn-off.
+Degradation is estimated *within stints* so that differences between cars and
+drivers do not leak into the slope (a pooled regression would mix them).
 """
 
 import logging
-from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
+from scipy import stats
+
+from f1_analysis.utils.validation import pace_column, representative_laps, require_columns
 
 logger = logging.getLogger(__name__)
 
-# Check if scipy is available
-_HAS_SCIPY = False
-try:
-    from scipy import stats as sp_stats
-    _HAS_SCIPY = True
-except (ImportError, Exception):
-    _HAS_SCIPY = False
 
-
-def _fit_linear_regression(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
-    """Fit OLS linear regression y = intercept + slope * x using NumPy or SciPy."""
-    if _HAS_SCIPY:
-        try:
-            reg = sp_stats.linregress(x, y)
-            return {
-                "intercept": float(reg.intercept),
-                "slope": float(reg.slope),
-                "r_squared": float(reg.rvalue ** 2),
-                "p_value": float(reg.pvalue),
-                "std_err": float(reg.stderr),
-            }
-        except Exception:
-            pass
-
-    # Pure NumPy analytical OLS fallback: slope = Cov(x,y) / Var(x)
-    n = len(x)
-    x_mean = np.mean(x)
-    y_mean = np.mean(y)
-    ss_xy = np.sum((x - x_mean) * (y - y_mean))
-    ss_xx = np.sum((x - x_mean) ** 2)
-
-    if ss_xx == 0:
-        return {"intercept": float(y_mean), "slope": 0.0, "r_squared": 0.0, "p_value": 1.0, "std_err": 0.0}
-
-    slope = float(ss_xy / ss_xx)
-    intercept = float(y_mean - slope * x_mean)
-
-    y_pred = intercept + slope * x
-    ss_tot = np.sum((y - y_mean) ** 2)
-    ss_res = np.sum((y - y_pred) ** 2)
-    r_squared = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
-
-    return {
-        "intercept": intercept,
-        "slope": slope,
-        "r_squared": max(0.0, r_squared),
-        "p_value": 0.0,
-        "std_err": 0.0,
-    }
+def _prepare(df: pd.DataFrame, use_fuel_corrected: bool) -> tuple[pd.DataFrame, str]:
+    """Representative laps with known compound, stint and tyre age."""
+    require_columns(df, ["driver_id", "compound", "stint_number", "tyre_age", "lap_time_sec"], "df_laps")
+    col = pace_column(df, use_fuel_corrected)
+    laps = representative_laps(df)
+    laps = laps[laps[col].notna() & laps["tyre_age"].notna() & laps["compound"].notna()]
+    laps = laps[laps["compound"] != "UNKNOWN"]
+    return laps, col
 
 
 def compute_compound_degradation(
@@ -67,126 +30,87 @@ def compute_compound_degradation(
     min_stint_laps: int = 5,
     use_fuel_corrected: bool = True,
 ) -> pd.DataFrame:
-    """Calculate the tyre degradation slope (seconds lost per lap of tyre age) by compound.
+    """Within-stint (fixed-effects) degradation slope per compound.
 
-    Fits Ordinary Least Squares (OLS) regression:
-        lap_time = alpha + beta * tyre_age
+    For every stint s (driver + stint number) we subtract the stint means:
+        y' = lap_time - mean_s(lap_time),  x' = tyre_age - mean_s(tyre_age)
+    then fit y' = beta * x' by OLS (scipy.stats.linregress) on all stints of a
+    compound. beta is the average seconds lost per extra lap of tyre age,
+    comparing each car only with itself.
 
-    where beta is the degradation coefficient in seconds/lap.
-
-    Args:
-        df_laps_with_stints: DataFrame containing ['compound', 'tyre_age', 'lap_time_sec']
-                             and optionally ['is_valid_representative_lap', 'fuel_corrected_lap_sec'].
-        min_stint_laps: Minimum data points required to fit a regression model.
-        use_fuel_corrected: Whether to model fuel-corrected lap times.
-
-    Returns:
-        DataFrame summarizing compound metrics, slope (beta), and r_squared.
+    Caveats: p-values assume independent laps (they are autocorrelated) and the
+    linregress degrees of freedom ignore the removed stint means, so p-values
+    are optimistic. Fuel correction is an assumption; without it slopes are
+    biased downwards (cars get lighter as tyres age). This is association, not
+    a controlled experiment: traffic and track evolution remain confounders.
     """
-    df = df_laps_with_stints.copy()
-    col = (
-        "fuel_corrected_lap_sec"
-        if use_fuel_corrected and "fuel_corrected_lap_sec" in df.columns
-        else "lap_time_sec"
-    )
-
-    if "is_valid_representative_lap" in df.columns:
-        df = df[df["is_valid_representative_lap"]].copy()
-
-    df = df[df[col].notna() & df["tyre_age"].notna() & (df["tyre_age"] > 0)]
-    if df.empty or "compound" not in df.columns:
+    laps, col = _prepare(df_laps_with_stints, use_fuel_corrected)
+    if laps.empty:
         return pd.DataFrame()
 
-    results = []
-    for compound, group in df.groupby("compound"):
-        if compound == "UNKNOWN" or len(group) < min_stint_laps:
+    keys = ["driver_id", "stint_number"]
+    sizes = laps.groupby(keys)[col].transform("size")
+    laps = laps[sizes >= min_stint_laps].copy()
+    if laps.empty:
+        return pd.DataFrame()
+
+    laps["y_dm"] = laps[col] - laps.groupby(keys)[col].transform("mean")
+    laps["x_dm"] = laps["tyre_age"] - laps.groupby(keys)["tyre_age"].transform("mean")
+
+    records = []
+    for compound, g in laps.groupby("compound"):
+        if g["x_dm"].nunique() < 2:
             continue
-
-        x = group["tyre_age"].values.astype(float)
-        y = group[col].values.astype(float)
-
-        fit = _fit_linear_regression(x, y)
-
-        results.append({
+        reg = stats.linregress(g["x_dm"].to_numpy(float), g["y_dm"].to_numpy(float))
+        records.append({
             "compound": compound,
-            "sample_size_laps": len(x),
-            "mean_tyre_age": float(np.mean(x)),
-            "max_tyre_age": float(np.max(x)),
-            "base_pace_intercept_sec": fit["intercept"],
-            "degradation_slope_sec_per_lap": fit["slope"],
-            "r_squared": fit["r_squared"],
-            "p_value": fit["p_value"],
+            "n_stints": g.groupby(keys).ngroups,
+            "n_laps": len(g),
+            "median_lap_sec": float(g[col].median()),
+            "max_tyre_age": float(g["tyre_age"].max()),
+            "degradation_sec_per_lap": float(reg.slope),
+            "slope_std_err": float(reg.stderr),
+            "slope_ci95_low": float(reg.slope - 1.96 * reg.stderr),
+            "slope_ci95_high": float(reg.slope + 1.96 * reg.stderr),
+            "r_squared_within": float(reg.rvalue ** 2),
+            "p_value": float(reg.pvalue),
         })
-
-    summary_df = pd.DataFrame(results)
-    if not summary_df.empty:
-        summary_df.sort_values(by="base_pace_intercept_sec", inplace=True)
-        summary_df.reset_index(drop=True, inplace=True)
-
-    return summary_df
+    out = pd.DataFrame(records)
+    return out.sort_values("degradation_sec_per_lap").reset_index(drop=True) if not out.empty else out
 
 
 def compute_driver_stint_summary(
     df_laps_with_stints: pd.DataFrame,
     use_fuel_corrected: bool = True,
+    min_laps_for_slope: int = 4,
 ) -> pd.DataFrame:
-    """Summarize individual driver stints, duration, and observed degradation rates.
+    """One row per driver stint with length, median pace and its own OLS slope.
 
-    Args:
-        df_laps_with_stints: DataFrame containing lap and stint metadata.
-        use_fuel_corrected: Whether to measure degradation using fuel-corrected times.
-
-    Returns:
-        DataFrame breakdown per driver and stint.
+    ``stint_length_laps`` counts all laps of the stint; slope and median use
+    representative laps only.
     """
-    df = df_laps_with_stints.copy()
-    col = (
-        "fuel_corrected_lap_sec"
-        if use_fuel_corrected and "fuel_corrected_lap_sec" in df.columns
-        else "lap_time_sec"
-    )
-
-    if "is_valid_representative_lap" in df.columns:
-        valid_df = df[df["is_valid_representative_lap"]].copy()
-    else:
-        valid_df = df.copy()
+    require_columns(df_laps_with_stints, ["driver_id", "stint_number", "lap_number"], "df_laps")
+    all_laps = df_laps_with_stints.dropna(subset=["stint_number"])
+    laps, col = _prepare(df_laps_with_stints, use_fuel_corrected)
 
     records = []
-    for (driver_id, stint_num), group in valid_df.groupby(["driver_id", "stint_number"]):
-        times = group[col].dropna().values
-        tyre_ages = group["tyre_age"].dropna().values
-
-        if len(times) == 0:
-            continue
-
-        compound = group["compound"].iloc[0] if "compound" in group.columns else "UNKNOWN"
-        start_lap = int(group["lap_number"].min())
-        end_lap = int(group["lap_number"].max())
-        stint_length = len(group)
-
-        if len(times) >= 4 and len(np.unique(tyre_ages)) > 1:
-            fit = _fit_linear_regression(tyre_ages.astype(float), times.astype(float))
-            deg_slope = fit["slope"]
-            r_sq = fit["r_squared"]
-        else:
-            deg_slope = np.nan
-            r_sq = np.nan
-
+    for (driver_id, stint), g_all in all_laps.groupby(["driver_id", "stint_number"]):
+        g = laps[(laps["driver_id"] == driver_id) & (laps["stint_number"] == stint)]
+        slope, r2 = np.nan, np.nan
+        if len(g) >= min_laps_for_slope and g["tyre_age"].nunique() > 1:
+            reg = stats.linregress(g["tyre_age"].to_numpy(float), g[col].to_numpy(float))
+            slope, r2 = float(reg.slope), float(reg.rvalue ** 2)
         records.append({
             "driver_id": driver_id,
-            "stint_number": stint_num,
-            "compound": compound,
-            "start_lap": start_lap,
-            "end_lap": end_lap,
-            "stint_length_laps": stint_length,
-            "median_pace_sec": float(np.median(times)),
-            "degradation_sec_per_lap": deg_slope,
-            "r_squared": r_sq,
+            "stint_number": int(stint),
+            "compound": g_all["compound"].iloc[0],
+            "start_lap": int(g_all["lap_number"].min()),
+            "end_lap": int(g_all["lap_number"].max()),
+            "stint_length_laps": len(g_all),
+            "representative_laps": len(g),
+            "median_pace_sec": float(g[col].median()) if len(g) else np.nan,
+            "degradation_sec_per_lap": slope,
+            "r_squared": r2,
         })
-
-    stint_df = pd.DataFrame(records)
-    if not stint_df.empty:
-        stint_df.sort_values(by=["driver_id", "stint_number"], inplace=True)
-        stint_df.reset_index(drop=True, inplace=True)
-
-    return stint_df
+    out = pd.DataFrame(records)
+    return out.sort_values(["driver_id", "stint_number"]).reset_index(drop=True) if not out.empty else out

@@ -1,24 +1,14 @@
-"""Driver performance analytics module for F1 Race Intelligence.
-
-Provides statistical summaries of driver pace, consistency metrics (standard deviation,
-interquartile range), teammate comparisons, and fastest lap analysis using Pandas
-and NumPy (with optional SciPy if environment policies permit C-extensions).
-"""
+"""Module A - driver pace and consistency."""
 
 import logging
-from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
+from scipy import stats
+
+from f1_analysis.utils.validation import pace_column, representative_laps, require_columns
 
 logger = logging.getLogger(__name__)
-
-# Check if scipy is available without DLL blocks
-_HAS_SCIPY = False
-try:
-    from scipy import stats as sp_stats
-    _HAS_SCIPY = True
-except (ImportError, Exception):
-    _HAS_SCIPY = False
 
 
 def compute_driver_pace_metrics(
@@ -26,142 +16,88 @@ def compute_driver_pace_metrics(
     use_fuel_corrected: bool = False,
     only_representative: bool = True,
 ) -> pd.DataFrame:
-    """Compute comprehensive statistical pace metrics for each driver in a race.
+    """Per-driver pace statistics.
 
-    Metrics computed:
-    - total_laps: Count of all recorded laps.
-    - representative_laps: Count of clean representative laps evaluated.
-    - mean_lap_sec: Arithmetic mean of lap times.
-    - median_lap_sec: 50th percentile (robust to outliers).
-    - std_lap_sec: Sample standard deviation (lower = more consistent).
-    - iqr_lap_sec: Interquartile Range (Q75 - Q25), robust non-parametric consistency measure.
-    - fastest_lap_sec: Absolute fastest lap recorded.
+    Columns: driver_id, total_laps, representative_laps, mean_lap_sec,
+    median_lap_sec, std_lap_sec (sample, ddof=1), iqr_lap_sec, fastest_lap_sec,
+    gap_to_fastest_sec (median vs. the best median).
 
-    Args:
-        df_laps: DataFrame containing lap records with ['driver_id', 'lap_time_sec'].
-        use_fuel_corrected: If True, uses 'fuel_corrected_lap_sec' instead of raw lap times.
-        only_representative: If True, filters using 'is_valid_representative_lap'.
-
-    Returns:
-        DataFrame sorted by median lap time ascending with gap to fastest driver.
+    Median and IQR are preferred for comparisons because lap-time
+    distributions are right-skewed (traffic, mistakes).
     """
-    df = df_laps.copy()
-    col = (
-        "fuel_corrected_lap_sec"
-        if use_fuel_corrected and "fuel_corrected_lap_sec" in df.columns
-        else "lap_time_sec"
-    )
-
-    if only_representative and "is_valid_representative_lap" in df.columns:
-        valid_df = df[df["is_valid_representative_lap"]].copy()
-    else:
-        valid_df = df[df[col].notna() & (df[col] > 0)].copy()
-
-    if valid_df.empty:
+    require_columns(df_laps, ["driver_id", "lap_time_sec"], "df_laps")
+    col = pace_column(df_laps, use_fuel_corrected)
+    laps = representative_laps(df_laps) if only_representative else df_laps.copy()
+    laps = laps[laps[col].notna() & (laps[col] > 0)]
+    if laps.empty:
         return pd.DataFrame()
 
-    records = []
-    for driver_id, group in valid_df.groupby("driver_id"):
-        times = group[col].dropna().values
-        if len(times) == 0:
-            continue
-
-        q75, q25 = np.percentile(times, [75, 25])
-        iqr = float(q75 - q25)
-
-        total_driver_laps = len(df[df["driver_id"] == driver_id])
-        records.append({
-            "driver_id": driver_id,
-            "total_laps": total_driver_laps,
-            "representative_laps": len(times),
-            "mean_lap_sec": float(np.mean(times)),
-            "median_lap_sec": float(np.median(times)),
-            "std_lap_sec": float(np.std(times, ddof=1)) if len(times) > 1 else 0.0,
-            "iqr_lap_sec": iqr,
-            "fastest_lap_sec": float(np.min(times)),
-        })
-
-    summary_df = pd.DataFrame(records)
-    if not summary_df.empty:
-        summary_df.sort_values(by="median_lap_sec", inplace=True)
-        summary_df.reset_index(drop=True, inplace=True)
-        fastest_median = summary_df["median_lap_sec"].iloc[0]
-        summary_df["gap_to_fastest_sec"] = summary_df["median_lap_sec"] - fastest_median
-
-    return summary_df
+    grouped = laps.groupby("driver_id")[col]
+    summary = pd.DataFrame({
+        "representative_laps": grouped.count(),
+        "mean_lap_sec": grouped.mean(),
+        "median_lap_sec": grouped.median(),
+        "std_lap_sec": grouped.std(ddof=1),
+        "iqr_lap_sec": grouped.quantile(0.75) - grouped.quantile(0.25),
+        "fastest_lap_sec": grouped.min(),
+    })
+    summary.insert(0, "total_laps", df_laps.groupby("driver_id").size().reindex(summary.index))
+    summary = summary.sort_values("median_lap_sec").reset_index()
+    summary["gap_to_fastest_sec"] = summary["median_lap_sec"] - summary["median_lap_sec"].iloc[0]
+    return summary
 
 
 def compare_teammates(
     df_laps: pd.DataFrame,
     df_results: pd.DataFrame,
     use_fuel_corrected: bool = False,
+    min_laps: int = 5,
+    alpha: float = 0.05,
 ) -> pd.DataFrame:
-    """Perform statistical pace comparison between teammates in the same constructor.
+    """Compare the two drivers of each constructor.
 
-    Compares median pace, standard deviation, and performs two-sample significance
-    testing (Welch's t-test and Mann-Whitney U test) when available.
+    Reports the median delta plus Welch's t-test and the Mann-Whitney U test.
 
-    Args:
-        df_laps: Cleaned lap times DataFrame.
-        df_results: Race results containing ['driver_id', 'constructor_id', 'constructor_name'].
-        use_fuel_corrected: Whether to base comparison on fuel-corrected times.
+    Statistical caveat (important): both tests assume independent observations.
+    Consecutive laps are autocorrelated (tyre wear, fuel, traffic) and teammates
+    may run different strategies, so p-values are optimistic. Treat them as a
+    descriptive indication, not proof of a pace difference.
 
-    Returns:
-        DataFrame detailing teammate pairs, pace deltas, and statistical significance p-values.
+    ``delta_sec`` = median(driver_1) - median(driver_2); negative means driver_1 faster.
     """
+    require_columns(df_laps, ["driver_id", "lap_time_sec"], "df_laps")
     if df_results.empty or df_laps.empty:
         return pd.DataFrame()
-
-    col = (
-        "fuel_corrected_lap_sec"
-        if use_fuel_corrected and "fuel_corrected_lap_sec" in df_laps.columns
-        else "lap_time_sec"
-    )
-    valid_laps = df_laps[df_laps.get("is_valid_representative_lap", True)].copy()
+    col = pace_column(df_laps, use_fuel_corrected)
+    laps = representative_laps(df_laps)
 
     records = []
-    for constructor_id, team_group in df_results.groupby("constructor_id"):
-        drivers = team_group["driver_id"].unique()
+    for constructor_id, team in df_results.groupby("constructor_id"):
+        drivers = team.sort_values("position")["driver_id"].tolist()
         if len(drivers) < 2:
             continue
-
-        d1, d2 = drivers[0], drivers[1]
-        team_name = team_group["constructor_name"].iloc[0]
-
-        d1_times = valid_laps[valid_laps["driver_id"] == d1][col].dropna().values
-        d2_times = valid_laps[valid_laps["driver_id"] == d2][col].dropna().values
-
-        if len(d1_times) < 3 or len(d2_times) < 3:
+        d1, d2 = drivers[:2]
+        t1 = laps.loc[laps["driver_id"] == d1, col].dropna().to_numpy()
+        t2 = laps.loc[laps["driver_id"] == d2, col].dropna().to_numpy()
+        if len(t1) < min_laps or len(t2) < min_laps:
             continue
 
-        d1_median = float(np.median(d1_times))
-        d2_median = float(np.median(d2_times))
-        delta_median = d1_median - d2_median
-
-        p_val_ttest = np.nan
-        p_val_mw = np.nan
-        is_sig = False
-
-        if _HAS_SCIPY:
-            try:
-                _, p_val_ttest = sp_stats.ttest_ind(d1_times, d2_times, equal_var=False)
-                _, p_val_mw = sp_stats.mannwhitneyu(d1_times, d2_times, alternative="two-sided")
-                is_sig = bool(p_val_mw < 0.05)
-            except Exception:
-                pass
-
+        _, p_t = stats.ttest_ind(t1, t2, equal_var=False)
+        _, p_mw = stats.mannwhitneyu(t1, t2, alternative="two-sided")
+        delta = float(np.median(t1) - np.median(t2))
         records.append({
             "constructor_id": constructor_id,
-            "constructor_name": team_name,
+            "constructor_name": team["constructor_name"].iloc[0],
             "driver_1": d1,
             "driver_2": d2,
-            "driver_1_median_sec": d1_median,
-            "driver_2_median_sec": d2_median,
-            "delta_sec": delta_median,  # Negative means driver 1 is faster
-            "faster_driver": d1 if delta_median < 0 else d2,
-            "ttest_p_value": float(p_val_ttest) if not np.isnan(p_val_ttest) else None,
-            "mannwhitney_p_value": float(p_val_mw) if not np.isnan(p_val_mw) else None,
-            "is_statistically_significant": is_sig,
+            "n_laps_1": len(t1),
+            "n_laps_2": len(t2),
+            "driver_1_median_sec": float(np.median(t1)),
+            "driver_2_median_sec": float(np.median(t2)),
+            "delta_sec": delta,
+            "faster_driver": d1 if delta < 0 else d2,
+            "welch_t_p_value": float(p_t),
+            "mannwhitney_p_value": float(p_mw),
+            "significant_at_alpha": bool(p_mw < alpha),
         })
-
     return pd.DataFrame(records)
