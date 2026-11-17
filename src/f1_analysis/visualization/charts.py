@@ -1,265 +1,190 @@
-"""Publication-quality visualization module for F1 Race Intelligence.
+"""Charts built with Matplotlib/Seaborn (static) and Plotly (interactive).
 
-Generates broadcast-grade figures using Matplotlib, Seaborn, and Plotly, adhering
-to official F1 compound and team color conventions.
+Every function returns a Figure and never calls ``plt.show()``, so the same
+code works in Jupyter (figures display inline) and in Streamlit (``st.pyplot``).
+The Matplotlib backend is NOT forced here: Jupyter/Streamlit choose it.
 """
 
-import os
-import tempfile
-from typing import Dict, List, Optional
-import matplotlib
-# Use non-interactive backend for headless/server execution
-matplotlib.use("Agg")
-# Set a writable temporary config directory to prevent Windows permission warnings
-os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
+import seaborn as sns
 
-from src.f1_analysis.config import COMPOUND_COLORS, CONSTRUCTOR_COLORS
+from f1_analysis.analysis.race_dynamics import compute_gap_to_leader
+from f1_analysis.config import COMPOUND_COLORS, CONSTRUCTOR_COLORS
+from f1_analysis.utils.validation import pace_column, representative_laps
 
-# Configure professional dark/light styling
-sns.set_theme(style="whitegrid", font="sans-serif")
+sns.set_theme(style="whitegrid")
+
+
+def team_color(constructor_name: str) -> str:
+    """Return the team colour for a Jolpica constructor name (grey if unknown)."""
+    name = str(constructor_name).lower()
+    for key, color in CONSTRUCTOR_COLORS.items():
+        if key in name:
+            return color
+    return "#888888"
+
+
+def _empty_figure(message: str, figsize=(8, 3)) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.text(0.5, 0.5, message, ha="center", va="center")
+    ax.set_axis_off()
+    return fig
+
+
+def _pace_label(col: str) -> str:
+    return "Fuel-corrected lap time (s)" if col == "fuel_corrected_lap_sec" else "Lap time (s)"
 
 
 def plot_driver_pace_distributions(
     df_laps: pd.DataFrame,
-    df_results: Optional[pd.DataFrame] = None,
     top_n: int = 10,
     use_fuel_corrected: bool = False,
     figsize: tuple = (12, 6),
 ) -> plt.Figure:
-    """Generate publication boxplot + stripplot showing driver pace distribution and consistency.
+    """Box plot + individual laps for the ``top_n`` drivers by median pace."""
+    col = pace_column(df_laps, use_fuel_corrected)
+    laps = representative_laps(df_laps).dropna(subset=[col])
+    if laps.empty:
+        return _empty_figure("No representative laps available")
 
-    Args:
-        df_laps: DataFrame containing lap times with ['driver_id', 'lap_time_sec'].
-        df_results: Optional race classification to sort drivers by finishing order.
-        top_n: Number of drivers to display.
-        use_fuel_corrected: If True, uses 'fuel_corrected_lap_sec'.
-        figsize: Matplotlib figure size tuple.
+    order = laps.groupby("driver_id")[col].median().nsmallest(top_n).index.tolist()
+    data = laps[laps["driver_id"].isin(order)]
 
-    Returns:
-        Matplotlib Figure object.
-    """
-    col = (
-        "fuel_corrected_lap_sec"
-        if use_fuel_corrected and "fuel_corrected_lap_sec" in df_laps.columns
-        else "lap_time_sec"
-    )
-
-    valid = df_laps[df_laps.get("is_valid_representative_lap", True)].copy()
-    valid = valid[valid[col].notna() & (valid[col] > 0)]
-
-    if valid.empty:
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.text(0.5, 0.5, "No data available", ha="center", va="center")
-        return fig
-
-    # Determine driver ordering (by median pace or finish position)
-    order = (
-        valid.groupby("driver_id")[col]
-        .median()
-        .sort_values()
-        .head(top_n)
-        .index.tolist()
-    )
-    plot_data = valid[valid["driver_id"].isin(order)]
-
-    fig, ax = plt.subplots(figsize=figsize, dpi=120)
-
-    # Boxplot for quartiles and IQR consistency
-    sns.boxplot(
-        data=plot_data,
-        x="driver_id",
-        y=col,
-        order=order,
-        palette="Blues_r",
-        showmeans=True,
-        meanprops={"marker": "o", "markerfacecolor": "red", "markeredgecolor": "red"},
-        ax=ax,
-        fliersize=0,
-        boxprops=dict(alpha=0.7),
-    )
-
-    # Overlay strip points for transparency of sample density
-    sns.stripplot(
-        data=plot_data,
-        x="driver_id",
-        y=col,
-        order=order,
-        color="black",
-        alpha=0.25,
-        size=4,
-        jitter=0.2,
-        ax=ax,
-    )
-
-    title_metric = "Fuel-Corrected Lap Time (s)" if use_fuel_corrected else "Raw Lap Time (s)"
-    ax.set_title(f"Driver Pace Distribution & Consistency (Top {top_n})", fontsize=14, fontweight="bold", pad=12)
-    ax.set_xlabel("Driver ID", fontsize=11, fontweight="bold")
-    ax.set_ylabel(title_metric, fontsize=11, fontweight="bold")
-    plt.xticks(rotation=35, ha="right")
-    plt.tight_layout()
-
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.boxplot(data=data, x="driver_id", y=col, order=order, hue="driver_id",
+                palette="Blues_r", legend=False, showfliers=False, ax=ax)
+    sns.stripplot(data=data, x="driver_id", y=col, order=order, color="black",
+                  alpha=0.3, size=3, jitter=0.2, ax=ax)
+    ax.set_title(f"Lap-time distribution, top {len(order)} drivers by median pace")
+    ax.set_xlabel("Driver")
+    ax.set_ylabel(_pace_label(col))
+    ax.tick_params(axis="x", rotation=35)
+    fig.tight_layout()
     return fig
 
 
-def plot_tyre_degradation_regression(
+def plot_tyre_degradation(
     df_laps_with_stints: pd.DataFrame,
+    use_fuel_corrected: bool = True,
     figsize: tuple = (11, 6),
 ) -> plt.Figure:
-    """Generate scatter plot with OLS linear regression fits per tyre compound.
+    """Lap time vs. tyre age, coloured by compound, with a per-compound linear trend.
 
-    Visualizes degradation curves: lap time vs. tyre age, color-coded by compound.
-
-    Args:
-        df_laps_with_stints: Cleaned DataFrame with ['compound', 'tyre_age', 'lap_time_sec']
-                             or 'fuel_corrected_lap_sec'.
-
-    Returns:
-        Matplotlib Figure object.
+    The trend lines are a pooled visual guide; the numeric slopes reported by
+    ``compute_compound_degradation`` use the within-stint estimator.
     """
-    col = (
-        "fuel_corrected_lap_sec"
-        if "fuel_corrected_lap_sec" in df_laps_with_stints.columns
-        else "lap_time_sec"
-    )
+    col = pace_column(df_laps_with_stints, use_fuel_corrected)
+    laps = representative_laps(df_laps_with_stints)
+    if "compound" not in laps:
+        return _empty_figure("No tyre data available")
+    laps = laps.dropna(subset=[col, "tyre_age", "compound"])
+    laps = laps[laps["compound"] != "UNKNOWN"]
+    if laps.empty:
+        return _empty_figure("No tyre data available")
 
-    df = df_laps_with_stints[df_laps_with_stints.get("is_valid_representative_lap", True)].copy()
-    df = df[df[col].notna() & df["tyre_age"].notna() & (df["compound"] != "UNKNOWN")]
-
-    fig, ax = plt.subplots(figsize=figsize, dpi=120)
-
-    for compound, group in df.groupby("compound"):
-        color = COMPOUND_COLORS.get(compound.upper(), "#333333")
-        # In dark or light background, make white hard visible
-        edge_color = "black" if color == "#FFFFFF" else color
-        fill_color = "#E0E0E0" if color == "#FFFFFF" else color
-
-        # Scatter
-        ax.scatter(
-            group["tyre_age"],
-            group[col],
-            label=f"{compound} (n={len(group)})",
-            color=fill_color,
-            edgecolors=edge_color,
-            alpha=0.6,
-            s=35,
-        )
-
-        # Regression line
-        if len(group) >= 5 and group["tyre_age"].nunique() > 1:
-            x = group["tyre_age"].values.astype(float)
-            y = group[col].values.astype(float)
-            p = np.polyfit(x, y, deg=1)
-            x_range = np.linspace(x.min(), x.max(), 50)
-            ax.plot(
-                x_range,
-                np.polyval(p, x_range),
-                color=edge_color,
-                linewidth=2.5,
-                linestyle="--",
-            )
-
-    ax.set_title("Tyre Compound Degradation (Fuel-Corrected Pace vs. Tyre Age)", fontsize=14, fontweight="bold", pad=12)
-    ax.set_xlabel("Tyre Age (Laps Completed on Set)", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Fuel-Corrected Lap Time (s)", fontsize=11, fontweight="bold")
-    ax.legend(title="Compound", frameon=True)
-    plt.tight_layout()
-
+    fig, ax = plt.subplots(figsize=figsize)
+    for compound, g in laps.groupby("compound"):
+        color = COMPOUND_COLORS.get(compound, COMPOUND_COLORS["UNKNOWN"])
+        ax.scatter(g["tyre_age"], g[col], color=color, edgecolors="black",
+                   linewidths=0.3, alpha=0.6, s=25, label=f"{compound} (n={len(g)})")
+        if len(g) >= 5 and g["tyre_age"].nunique() > 1:
+            slope, intercept = np.polyfit(g["tyre_age"], g[col], deg=1)
+            xs = np.linspace(g["tyre_age"].min(), g["tyre_age"].max(), 50)
+            ax.plot(xs, intercept + slope * xs, color="black", linestyle="--", linewidth=1)
+            ax.plot(xs, intercept + slope * xs, color=color, linewidth=2.5, alpha=0.8)
+    ax.set_title("Lap time vs. tyre age by compound")
+    ax.set_xlabel("Tyre age (laps completed on the set)")
+    ax.set_ylabel(_pace_label(col))
+    ax.legend(title="Compound")
+    fig.tight_layout()
     return fig
 
 
-def plot_position_progression_chart(
-    df_laps: pd.DataFrame,
-    top_n: int = 10,
-    figsize: tuple = (13, 7),
-) -> plt.Figure:
-    """Generate broadcast lap chart showing track position evolution across the Grand Prix.
+def plot_position_progression(df_laps: pd.DataFrame, top_n: int = 10, figsize: tuple = (13, 7)) -> plt.Figure:
+    """Lap chart for the drivers who finished in the top ``top_n`` positions."""
+    if df_laps.empty or "position" not in df_laps:
+        return _empty_figure("No position data available")
+    last = df_laps.sort_values("lap_number").groupby("driver_id").tail(1)
+    drivers = last.sort_values(["lap_number", "position"], ascending=[False, True]).head(top_n)["driver_id"]
 
-    Args:
-        df_laps: Lap times DataFrame with ['lap_number', 'driver_id', 'position'].
-        top_n: Display top N drivers at race finish.
+    fig, ax = plt.subplots(figsize=figsize)
+    palette = sns.color_palette("tab20", n_colors=len(drivers))
+    for color, driver in zip(palette, drivers):
+        d = df_laps[df_laps["driver_id"] == driver].sort_values("lap_number")
+        ax.plot(d["lap_number"], d["position"], label=driver, color=color, linewidth=2)
+    max_pos = int(df_laps["position"].max())
+    ax.set_ylim(max_pos + 0.5, 0.5)            # P1 at the top
+    ax.set_yticks(range(1, max_pos + 1))
+    ax.set_title("Position by lap")
+    ax.set_xlabel("Lap")
+    ax.set_ylabel("Position")
+    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", title="Driver")
+    fig.tight_layout()
+    return fig
 
-    Returns:
-        Matplotlib Figure object.
-    """
-    fig, ax = plt.subplots(figsize=figsize, dpi=120)
 
-    # Determine top drivers
-    max_lap = df_laps["lap_number"].max()
-    final_positions = (
-        df_laps[df_laps["lap_number"] == max_lap]
-        .sort_values(by="position")
-        .head(top_n)["driver_id"]
-        .tolist()
-    )
-
-    palette = sns.color_palette("tab10", n_colors=len(final_positions))
-
-    for idx, driver_id in enumerate(final_positions):
-        driver_data = df_laps[df_laps["driver_id"] == driver_id].sort_values(by="lap_number")
-        ax.plot(
-            driver_data["lap_number"],
-            driver_data["position"],
-            label=driver_id,
-            color=palette[idx],
-            linewidth=2.2,
-            marker="o",
-            markersize=3,
-            alpha=0.85,
-        )
-
-    # Invert y-axis so P1 is at the top
+def plot_pit_stop_times(pit_summary: pd.DataFrame, figsize: tuple = (11, 5)) -> plt.Figure:
+    """Horizontal bars of median pit-lane time per driver, coloured by team."""
+    if pit_summary.empty or "median_pit_lane_sec" not in pit_summary:
+        return _empty_figure("No pit-stop data available")
+    data = pit_summary.dropna(subset=["median_pit_lane_sec"]).sort_values("median_pit_lane_sec")
+    colors = [team_color(c) for c in data.get("constructor_name", pd.Series([""] * len(data)))]
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.barh(data["driver_id"], data["median_pit_lane_sec"], color=colors, edgecolor="black")
     ax.invert_yaxis()
-    ax.set_yticks(range(1, top_n + 1))
-    ax.set_title("Race Position Evolution (Lap Chart)", fontsize=14, fontweight="bold", pad=12)
-    ax.set_xlabel("Lap Number", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Track Position (P1 = Leader)", fontsize=11, fontweight="bold")
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", title="Driver")
-    plt.tight_layout()
+    ax.set_xlim(data["median_pit_lane_sec"].min() * 0.95, data["median_pit_lane_sec"].max() * 1.02)
+    ax.set_title("Median pit-lane time per driver (entry to exit, anomalous stops excluded)")
+    ax.set_xlabel("Pit-lane time (s)")
+    fig.tight_layout()
+    return fig
 
+
+def plot_constructor_pace(team_pace: pd.DataFrame, figsize: tuple = (11, 5)) -> plt.Figure:
+    """Bar chart of each team's median-lap gap to the fastest team."""
+    if team_pace.empty:
+        return _empty_figure("No constructor data available")
+    data = team_pace.sort_values("gap_to_fastest_sec")
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.barh(data["constructor_name"], data["gap_to_fastest_sec"],
+            color=[team_color(c) for c in data["constructor_name"]], edgecolor="black")
+    ax.invert_yaxis()
+    ax.set_title("Constructor race pace: gap to fastest team (median representative lap)")
+    ax.set_xlabel("Gap (s)")
+    fig.tight_layout()
     return fig
 
 
 def create_interactive_gap_chart(df_laps: pd.DataFrame, top_n: int = 8) -> go.Figure:
-    """Create an interactive Plotly chart of time gap to the leader over the race distance.
-
-    Args:
-        df_laps: DataFrame with ['lap_number', 'driver_id', 'lap_time_sec'].
-        top_n: Number of drivers to display.
-
-    Returns:
-        Plotly Figure object.
-    """
-    from src.f1_analysis.analysis.race_dynamics import compute_gap_to_leader
-
-    gap_df = compute_gap_to_leader(df_laps)
-    if gap_df.empty:
+    """Interactive Plotly line chart of the gap to the leader."""
+    gaps = compute_gap_to_leader(df_laps)
+    if gaps.empty:
         return go.Figure()
-
-    # Filter to top N drivers by minimum average gap
-    top_drivers = (
-        gap_df.groupby("driver_id")["gap_to_leader_sec"]
-        .mean()
-        .sort_values()
-        .head(top_n)
-        .index.tolist()
-    )
-    plot_data = gap_df[gap_df["driver_id"].isin(top_drivers)]
-
+    last_lap = gaps.groupby("driver_id")["lap_number"].max()
+    final = gaps[gaps["lap_number"] == gaps["driver_id"].map(last_lap)]
+    drivers = final.sort_values(["lap_number", "position"], ascending=[False, True]).head(top_n)["driver_id"]
     fig = px.line(
-        plot_data,
-        x="lap_number",
-        y="gap_to_leader_sec",
-        color="driver_id",
-        title="Interval Gap to Race Leader Over Distance",
-        labels={"lap_number": "Lap Number", "gap_to_leader_sec": "Gap to Leader (seconds)", "driver_id": "Driver"},
-        template="plotly_white",
+        gaps[gaps["driver_id"].isin(drivers)], x="lap_number", y="gap_to_leader_sec", color="driver_id",
+        labels={"lap_number": "Lap", "gap_to_leader_sec": "Gap to leader (s)", "driver_id": "Driver"},
+        title="Gap to race leader", template="plotly_white",
     )
-    fig.update_layout(hovermode="x unified", legend_title_text="Driver")
+    fig.update_layout(hovermode="x unified")
     return fig
+
+
+def create_season_points_chart(season_points: pd.DataFrame) -> go.Figure:
+    """Interactive cumulative constructor points across rounds."""
+    if season_points.empty:
+        return go.Figure()
+    teams = season_points["constructor_name"].unique()
+    return px.line(
+        season_points, x="round", y="cumulative_points", color="constructor_name", markers=True,
+        color_discrete_map={t: team_color(t) for t in teams},
+        labels={"round": "Round", "cumulative_points": "Cumulative points", "constructor_name": "Team"},
+        title="Constructor points over the season (race results only)", template="plotly_white",
+    )

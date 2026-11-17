@@ -1,38 +1,55 @@
 """Interactive Streamlit dashboard for F1 Race Intelligence.
 
-Provides a multi-tab analytical interface investigating driver pace,
-tyre degradation models, pit stop strategy, and race dynamics.
-Adheres to Criterion 7 by consuming backend modules directly from src.f1_analysis.
+Run from the project root:
+    streamlit run app/dashboard.py
+
+All analytical logic lives in ``src/f1_analysis``; this file only wires UI
+controls to those functions and renders the returned tables and figures.
 """
 
 import sys
 from pathlib import Path
 
-# Add project root to sys.path to enable absolute package imports
-project_root = Path(__file__).resolve().parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-import streamlit as st
+import matplotlib.pyplot as plt
 import pandas as pd
-import numpy as np
+import streamlit as st
 
-from src.f1_analysis.data.api_client import F1ApiClient
-from src.f1_analysis.data.data_loader import F1DataLoader
-from src.f1_analysis.data.preprocessing import clean_lap_times, apply_fuel_correction, merge_laps_with_stints
-from src.f1_analysis.analysis.driver_performance import compute_driver_pace_metrics, compare_teammates
-from src.f1_analysis.analysis.tyre_analysis import compute_compound_degradation, compute_driver_stint_summary
-from src.f1_analysis.analysis.pitstop_analysis import compute_pit_stop_summary
-from src.f1_analysis.analysis.race_dynamics import compute_position_progression, compute_net_position_changes
-from src.f1_analysis.analysis.team_performance import compute_constructor_pace_ranking, compute_constructor_points_summary
-from src.f1_analysis.visualization.charts import (
-    plot_driver_pace_distributions,
-    plot_tyre_degradation_regression,
-    plot_position_progression_chart,
+from f1_analysis.analysis.driver_performance import (
+    compare_teammates,
+    compute_driver_pace_metrics,
+)
+from f1_analysis.analysis.pitstop_analysis import (
+    analyze_undercut,
+    compute_pit_stop_summary,
+    strategy_vs_result,
+)
+from f1_analysis.analysis.race_dynamics import compute_net_position_changes
+from f1_analysis.analysis.team_performance import (
+    compute_constructor_pace_ranking,
+    compute_constructor_points_summary,
+    compute_season_constructor_points,
+)
+from f1_analysis.analysis.tyre_analysis import (
+    compute_compound_degradation,
+    compute_driver_stint_summary,
+)
+from f1_analysis.data.api_client import DataFetchError
+from f1_analysis.data.data_loader import F1DataLoader
+from f1_analysis.pipeline import RaceDataset, build_race_dataset
+from f1_analysis.visualization.charts import (
     create_interactive_gap_chart,
+    create_season_points_chart,
+    plot_constructor_pace,
+    plot_driver_pace_distributions,
+    plot_pit_stop_times,
+    plot_position_progression,
+    plot_tyre_degradation,
 )
 
-# Page configuration
 st.set_page_config(
     page_title="F1 Race Intelligence | UNIMI",
     page_icon="🏎️",
@@ -41,36 +58,92 @@ st.set_page_config(
 )
 
 st.title("🏎️ F1 Race Intelligence")
-st.caption("Master's in Data Science — UNIMI | Coding for Data Science and Data Management")
+st.caption(
+    "Box, Box — Formula 1 Race Analytics | Master's in Data Science, University of Milan (UNIMI)"
+)
 
-# Initialize loader
-loader = F1DataLoader()
 
-# Sidebar: Race Selector
+@st.cache_data(show_spinner=False)
+def cached_calendar(year: int) -> pd.DataFrame:
+    return F1DataLoader().load_season_calendar(year)
+
+
+@st.cache_data(show_spinner=False)
+def cached_race_dataset(year: int, round_num: int) -> RaceDataset:
+    return build_race_dataset(year, round_num)
+
+
+@st.cache_data(show_spinner=False)
+def cached_season_points(year: int, rounds: tuple[int, ...]) -> pd.DataFrame:
+    return compute_season_constructor_points(F1DataLoader(), year, list(rounds))
+
+
+# ---------------------------------------------------------------------------
+# Sidebar controls
+# ---------------------------------------------------------------------------
 st.sidebar.header("Grand Prix Selection")
 selected_year = st.sidebar.selectbox("Season", [2024, 2023], index=0)
-selected_round = st.sidebar.slider("Round Number", min_value=1, max_value=24, value=1)
-use_fuel_corrected = st.sidebar.checkbox("Apply Fuel-Load Correction", value=True, help="Adds back ~0.035s/lap mass reduction effect to reveal true tyre wear.")
 
-# Load race data
-with st.spinner("Loading race data..."):
-    df_results = loader.load_race_results(selected_year, selected_round)
-    df_laps_raw = loader.load_race_laps(selected_year, selected_round)
-    df_pitstops = loader.load_pit_stops(selected_year, selected_round)
+try:
+    calendar_df = cached_calendar(selected_year)
+except DataFetchError:
+    calendar_df = pd.DataFrame()
 
-if df_results.empty or df_laps_raw.empty:
-    st.warning(f"No race data available for Season {selected_year}, Round {selected_round}. Please select a different round.")
+if not calendar_df.empty:
+    round_options = calendar_df["round"].tolist()
+    labels = {
+        int(r["round"]): f"R{int(r['round']):02d} — {r['race_name']}"
+        for _, r in calendar_df.iterrows()
+    }
+    selected_round = st.sidebar.selectbox(
+        "Grand Prix",
+        options=round_options,
+        index=0,
+        format_func=lambda r: labels.get(r, f"Round {r}"),
+    )
+else:
+    selected_round = st.sidebar.number_input("Round Number", min_value=1, max_value=24, value=1)
+
+use_fuel_corrected = st.sidebar.checkbox(
+    "Apply Fuel-Load Correction",
+    value=True,
+    help=(
+        "Adds back an estimated ~0.03 s/kg fuel mass effect across the race distance "
+        "so that lap-time trends reflect tyre wear rather than car weight reduction."
+    ),
+)
+top_n = st.sidebar.slider("Drivers shown in plots", min_value=5, max_value=20, value=10)
+
+# ---------------------------------------------------------------------------
+# Load and preprocess race dataset
+# ---------------------------------------------------------------------------
+try:
+    with st.spinner("Loading race dataset (using local cache if available)..."):
+        ds = cached_race_dataset(int(selected_year), int(selected_round))
+except DataFetchError as exc:
+    st.error(
+        f"Could not load data for Season {selected_year}, Round {selected_round}: {exc}\n\n"
+        f"Run `python scripts/download_data.py --year {selected_year} --rounds {selected_round}` "
+        "when connected to the internet to cache this race locally."
+    )
     st.stop()
 
-# Preprocess data
-df_laps_clean = clean_lap_times(df_laps_raw)
-df_laps = apply_fuel_correction(df_laps_clean)
+df_results = ds.results
+df_laps = ds.laps
+df_pitstops = ds.pitstops
 
-# Merge driver numbers into laps to enable stint linking
-driver_num_map = dict(zip(df_results["driver_id"], df_results.get("grid", range(1, len(df_results)+1))))
-df_laps_merged = merge_laps_with_stints(df_laps, pd.DataFrame())
+if df_results.empty or df_laps.empty:
+    st.warning(
+        f"No race classification or lap timing data found for {selected_year} Round {selected_round}."
+    )
+    st.stop()
 
-# Main Tabs
+for note in ds.notes:
+    st.info(note)
+
+race_title = ds.info.get("race_name", f"Round {selected_round}")
+circuit_name = ds.info.get("circuit", "")
+
 tab_overview, tab_driver, tab_tyre, tab_pit, tab_dynamics, tab_teams = st.tabs([
     "🏁 Race Overview",
     "🏎️ Driver Pace",
@@ -84,103 +157,178 @@ tab_overview, tab_driver, tab_tyre, tab_pit, tab_dynamics, tab_teams = st.tabs([
 # TAB 1: RACE OVERVIEW
 # ---------------------------------------------------------------------------
 with tab_overview:
-    st.subheader(f"Season {selected_year} — Round {selected_round} Classification")
-    col1, col2, col3 = st.columns(3)
-    winner = df_results.iloc[0]["driver_name"] if not df_results.empty else "N/A"
-    winner_team = df_results.iloc[0]["constructor_name"] if not df_results.empty else "N/A"
-    total_laps = int(df_laps["lap_number"].max()) if not df_laps.empty else 0
+    st.subheader(f"{selected_year} {race_title} ({circuit_name})")
+    col1, col2, col3, col4 = st.columns(4)
+    winner = df_results.iloc[0]["driver_name"]
+    winner_team = df_results.iloc[0]["constructor_name"]
+    total_laps = int(df_laps["lap_number"].max())
+    rep_ratio = df_laps["is_valid_representative_lap"].mean()
 
     col1.metric("Race Winner", winner)
     col2.metric("Winning Team", winner_team)
-    col3.metric("Race Distance", f"{total_laps} Laps")
+    col3.metric("Race Distance", f"{total_laps} laps")
+    col4.metric("Representative Laps", f"{rep_ratio:.1%}")
 
     st.dataframe(
-        df_results[["position", "driver_name", "constructor_name", "grid", "points", "status", "fastest_lap_time_str"]],
-        use_container_width=True,
+        df_results[
+            [
+                "position",
+                "driver_name",
+                "driver_code",
+                "constructor_name",
+                "grid",
+                "laps",
+                "status",
+                "points",
+                "fastest_lap_time_str",
+            ]
+        ],
+        width="stretch",
         hide_index=True,
     )
+
+    with st.expander("Data Cleaning Breakdown (Excluded Laps by Reason)"):
+        reasons = (
+            df_laps["exclusion_reason"]
+            .fillna("representative")
+            .value_counts()
+            .rename_axis("category")
+            .reset_index(name="lap_count")
+        )
+        st.dataframe(reasons, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
 # TAB 2: DRIVER PACE & CONSISTENCY
 # ---------------------------------------------------------------------------
 with tab_driver:
-    st.subheader("Driver Pace Distribution & Statistical Consistency")
-    st.markdown("""
-    - **Boxplot:** Interquartile range ($IQR = Q_{75} - Q_{25}$), median pace, and variance.
-    - **Consistency Metric ($\sigma$):** Lower standard deviation signifies high driver rhythm and tyre management.
-    """)
+    st.subheader("Driver Pace Distribution & Consistency")
+    st.markdown(
+        "- **Median & IQR ($Q_{75} - Q_{25}$)** are robust to traffic and single-lap mistakes.\n"
+        "- **Standard Deviation ($s$)** measures lap-to-lap variability on representative laps."
+    )
 
-    top_n = st.slider("Drivers to display", min_value=5, max_value=20, value=10)
-    fig_pace = plot_driver_pace_distributions(df_laps, top_n=top_n, use_fuel_corrected=use_fuel_corrected)
+    fig_pace = plot_driver_pace_distributions(
+        df_laps, top_n=top_n, use_fuel_corrected=use_fuel_corrected
+    )
     st.pyplot(fig_pace)
+    plt.close(fig_pace)
 
     pace_metrics = compute_driver_pace_metrics(df_laps, use_fuel_corrected=use_fuel_corrected)
-    st.dataframe(pace_metrics, use_container_width=True, hide_index=True)
+    st.dataframe(pace_metrics, width="stretch", hide_index=True)
 
-    st.subheader("Teammate Head-to-Head Pace Comparison")
+    st.subheader("Teammate Head-to-Head Comparison")
+    st.caption(
+        "Note: Welch's t-test and Mann-Whitney U test treat laps as independent observations. "
+        "Because consecutive laps are autocorrelated and strategies can differ, treat p-values "
+        "as descriptive indicators rather than strict causal proof."
+    )
     teammates = compare_teammates(df_laps, df_results, use_fuel_corrected=use_fuel_corrected)
     if not teammates.empty:
-        st.dataframe(teammates, use_container_width=True, hide_index=True)
+        st.dataframe(teammates, width="stretch", hide_index=True)
     else:
-        st.info("Insufficient lap data for statistical teammate comparison.")
+        st.info("Insufficient representative laps for teammate comparison.")
 
 # ---------------------------------------------------------------------------
 # TAB 3: TYRE DEGRADATION
 # ---------------------------------------------------------------------------
 with tab_tyre:
-    st.subheader("Tyre Compound Degradation Modeling (SciPy / OLS Regression)")
-    st.markdown(r"""
-    Ordinary Least Squares (OLS) regression models lap time degradation:
-    $$\text{Lap Time} = \alpha + \beta \times \text{Tyre Age}$$
-    where $\beta$ represents the seconds lost per lap of tyre age.
-    """)
+    st.subheader("Within-Stint Tyre Degradation Modeling")
+    st.markdown(
+        r"""
+        To prevent faster cars on harder tyres from biasing compound comparisons (Simpson's paradox),
+        degradation is estimated **within each stint** by demeaning lap time and tyre age per driver-stint:
+        $$y_{i} - \bar{y}_{s} = \beta \, (a_{i} - \bar{a}_{s}) + \varepsilon_{i}$$
+        where $\beta$ is the average time lost (in seconds) per extra lap of tyre age.
+        """
+    )
 
-    deg_summary = compute_compound_degradation(df_laps_merged, use_fuel_corrected=use_fuel_corrected)
+    deg_summary = compute_compound_degradation(df_laps, use_fuel_corrected=use_fuel_corrected)
     if not deg_summary.empty:
-        st.dataframe(deg_summary, use_container_width=True, hide_index=True)
-        fig_deg = plot_tyre_degradation_regression(df_laps_merged)
+        st.dataframe(deg_summary, width="stretch", hide_index=True)
+        fig_deg = plot_tyre_degradation(df_laps, use_fuel_corrected=use_fuel_corrected)
         st.pyplot(fig_deg)
+        plt.close(fig_deg)
     else:
-        st.info("Compound-level telemetry is being synthesized or requires session-level OpenF1 stint keys.")
+        st.info("No tyre compound stint data available for this race.")
 
-    st.subheader("Driver Stint Breakdown")
-    stint_summary = compute_driver_stint_summary(df_laps_merged, use_fuel_corrected=use_fuel_corrected)
-    st.dataframe(stint_summary, use_container_width=True, hide_index=True)
+    st.subheader("Individual Driver Stint Summary")
+    stint_summary = compute_driver_stint_summary(df_laps, use_fuel_corrected=use_fuel_corrected)
+    if not stint_summary.empty:
+        st.dataframe(stint_summary, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
 # TAB 4: PIT STOP STRATEGY
 # ---------------------------------------------------------------------------
 with tab_pit:
-    st.subheader("Pit Stop Strategy & Durations")
+    st.subheader("Pit-Lane Time & Stint Strategy Summary")
+    st.caption(
+        "Jolpica reports total pit-lane transit time (pit entry to pit exit), not stationary jack time. "
+        "Stops exceeding 2× the race median (e.g. red-flag periods or wing repairs) are flagged as anomalous."
+    )
     if not df_pitstops.empty:
         pit_summary = compute_pit_stop_summary(df_pitstops, df_results)
-        st.dataframe(pit_summary, use_container_width=True, hide_index=True)
+        fig_pit = plot_pit_stop_times(pit_summary)
+        st.pyplot(fig_pit)
+        plt.close(fig_pit)
+        st.dataframe(pit_summary, width="stretch", hide_index=True)
+
+        st.subheader("Observed Strategy vs. Classification")
+        strat_df = strategy_vs_result(df_pitstops, df_results, df_laps)
+        st.dataframe(strat_df, width="stretch", hide_index=True)
+
+        st.subheader("Undercut Evaluation (Observed Pit Sequence)")
+        drivers_list = df_results["driver_id"].tolist()
+        if len(drivers_list) >= 2:
+            c1, c2, c3 = st.columns(3)
+            attacker = c1.selectbox("Attacker (pitted earlier)", drivers_list, index=min(1, len(drivers_list) - 1))
+            defender = c2.selectbox("Defender (pitted later)", drivers_list, index=0)
+            stop_num = c3.number_input("Stop Number", min_value=1, max_value=5, value=1)
+            uc = analyze_undercut(df_laps, df_pitstops, attacker, defender, int(stop_num))
+            st.json(uc)
     else:
-        st.info("No pit-stop records logged for this session.")
+        st.info("No pit-stop records found for this race.")
 
 # ---------------------------------------------------------------------------
 # TAB 5: RACE DYNAMICS
 # ---------------------------------------------------------------------------
 with tab_dynamics:
-    st.subheader("Lap-by-Lap Track Position Progression")
-    fig_pos = plot_position_progression_chart(df_laps, top_n=top_n)
+    st.subheader("Lap-by-Lap Track Position Chart")
+    fig_pos = plot_position_progression(df_laps, top_n=top_n)
     st.pyplot(fig_pos)
+    plt.close(fig_pos)
 
     st.subheader("Interactive Gap to Race Leader")
-    fig_gap = create_interactive_gap_chart(df_laps, top_n=top_n)
-    st.plotly_chart(fig_gap, use_container_width=True)
+    fig_gap = create_interactive_gap_chart(df_laps, top_n=min(top_n, 10))
+    st.plotly_chart(fig_gap, width="stretch")
 
-    st.subheader("Net Positions Gained / Lost from Grid")
+    st.subheader("Net Positions Gained / Lost vs. Starting Grid")
     net_pos = compute_net_position_changes(df_results)
-    st.dataframe(net_pos, use_container_width=True, hide_index=True)
+    st.dataframe(net_pos, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
 # TAB 6: CONSTRUCTORS
 # ---------------------------------------------------------------------------
 with tab_teams:
-    st.subheader("Constructor Pace Rankings & Points Summary")
-    team_pace = compute_constructor_pace_ranking(df_laps, df_results, use_fuel_corrected=use_fuel_corrected)
-    st.dataframe(team_pace, use_container_width=True, hide_index=True)
+    st.subheader("Constructor Race Pace Ranking")
+    team_pace = compute_constructor_pace_ranking(
+        df_laps, df_results, use_fuel_corrected=use_fuel_corrected
+    )
+    if not team_pace.empty:
+        fig_team = plot_constructor_pace(team_pace)
+        st.pyplot(fig_team)
+        plt.close(fig_team)
+        st.dataframe(team_pace, width="stretch", hide_index=True)
 
+    st.subheader("Race Points Summary by Constructor")
     team_points = compute_constructor_points_summary(df_results)
-    st.dataframe(team_points, use_container_width=True, hide_index=True)
+    st.dataframe(team_points, width="stretch", hide_index=True)
+
+    st.subheader("Multi-Round Constructor Points Trend")
+    max_r = int(selected_round)
+    default_rounds = tuple(range(1, max(2, min(max_r + 1, 4))))
+    try:
+        season_pts = cached_season_points(int(selected_year), default_rounds)
+        if not season_pts.empty:
+            st.plotly_chart(create_season_points_chart(season_pts), width="stretch")
+    except DataFetchError:
+        st.info("Additional rounds not cached locally for multi-round trend.")
