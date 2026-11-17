@@ -115,9 +115,9 @@ In strict accordance with examination instructions, data is retrieved via open A
 ## 5. Development Status
 
 - [x] Phase 1: Environment & repository architecture setup.
-- [ ] Phase 2: Ingestion & API caching client (Jolpica + OpenF1).
-- [ ] Phase 3: Preprocessing, fuel-load correction & outlier filtering.
-- [ ] Phase 4: Core statistical & scientific computing modules.
-- [ ] Phase 5: Publication visualizations.
-- [ ] Phase 6: Streamlit dashboard & Jupyter presentation notebook.
-- [ ] Phase 7: Pytest test suite & examination defense preparation.
+- [x] Phase 2: Ingestion & API caching client (Jolpica + OpenF1).
+- [x] Phase 3: Preprocessing, fuel-load correction & outlier filtering.
+- [x] Phase 4: Core statistical & scientific computing modules (Modules A–E).
+- [x] Phase 5: Publication visualizations (Matplotlib, Seaborn, Plotly).
+- [x] Phase 6: Streamlit dashboard & Jupyter presentation notebook.
+- [x] Phase 7: Pytest test suite & unit verification.
