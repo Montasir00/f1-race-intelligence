@@ -1,21 +1,24 @@
-"""API client for fetching and caching Formula 1 data from Jolpica and OpenF1.
+"""HTTP client for the Jolpica (Ergast-compatible) and OpenF1 APIs with a local JSON cache.
 
-This module provides a unified interface to retrieve race schedules, results,
-lap-by-lap timing, pit stops, and stint/tyre telemetry with automatic local caching
-to guarantee offline reproducibility.
+Every response is saved under ``data/raw/`` so that analyses are reproducible
+offline once the data has been downloaded.
 """
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from src.f1_analysis.config import (
+from f1_analysis.config import (
     DEFAULT_TIMEOUT,
     JOLPICA_BASE_URL,
+    JOLPICA_PAGE_DELAY,
+    JOLPICA_PAGE_LIMIT,
     OPENF1_BASE_URL,
     RAW_DATA_DIR,
 )
@@ -23,37 +26,72 @@ from src.f1_analysis.config import (
 logger = logging.getLogger(__name__)
 
 
+class DataFetchError(RuntimeError):
+    """Raised when data cannot be downloaded and no valid cache exists."""
+
+
 class F1ApiClient:
-    """Client for interacting with Jolpica and OpenF1 APIs with local caching."""
+    """Client for Jolpica and OpenF1 with transparent on-disk caching."""
 
     def __init__(
         self,
         cache_dir: Optional[Path] = None,
         timeout: int = DEFAULT_TIMEOUT,
         max_retries: int = 3,
+        session: Optional[requests.Session] = None,
     ) -> None:
-        """Initialize the API client.
+        """Create the client.
 
         Args:
-            cache_dir: Directory to save cached JSON responses. Defaults to RAW_DATA_DIR.
-            timeout: HTTP request timeout in seconds.
-            max_retries: Number of retry attempts on transient network/server failures.
+            cache_dir: Folder for cached JSON files (default ``data/raw``).
+            timeout: Request timeout in seconds.
+            max_retries: Retries for transient errors (429 and 5xx).
+            session: Optional pre-built session (used by tests to inject fakes).
         """
-        self.cache_dir = cache_dir or RAW_DATA_DIR
-        self.timeout = timeout
+        self.cache_dir = Path(cache_dir) if cache_dir else RAW_DATA_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.timeout = timeout
 
-        # Configure session with robust retries for transient HTTP errors (429, 500, 502, 503, 504)
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        if session is None:
+            session = requests.Session()
+            retry = Retry(
+                total=max_retries,
+                backoff_factor=1.0,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET"],
+            )
+            session.mount("https://", HTTPAdapter(max_retries=retry))
+        self.session = session
+
+    # ------------------------------------------------------------------
+    # Low-level helpers
+    # ------------------------------------------------------------------
+    def _read_cache(self, path: Path) -> Optional[Any]:
+        """Return cached JSON, or None if the file is missing or corrupted."""
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Ignoring unreadable cache file %s (%s)", path.name, exc)
+            return None
+
+    def _write_cache(self, path: Path, data: Any) -> None:
+        """Write JSON atomically (temp file + rename) so a crash cannot leave half a file."""
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(path)
+
+    def _get_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Perform one GET request and decode JSON, wrapping failures in DataFetchError."""
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise DataFetchError(f"Request to {url} failed: {exc}") from exc
 
     def _fetch_with_cache(
         self,
@@ -62,176 +100,158 @@ class F1ApiClient:
         params: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> Any:
-        """Internal helper to retrieve data from local cache or make an HTTP GET request.
+        """Return cached JSON if present, otherwise download once and cache it."""
+        path = self.cache_dir / cache_filename
+        if not force_refresh:
+            cached = self._read_cache(path)
+            if cached is not None:
+                return cached
+        logger.info("Downloading %s", url)
+        data = self._get_json(url, params)
+        self._write_cache(path, data)
+        return data
 
-        Args:
-            url: The endpoint URL to query.
-            cache_filename: Target filename inside cache_dir (e.g. 'jolpica_2024_1_laps.json').
-            params: Optional query parameters for the request.
-            force_refresh: If True, bypasses local cache and fetches fresh data from API.
-
-        Returns:
-            Parsed JSON object (dict or list).
-
-        Raises:
-            requests.HTTPError: If HTTP request fails.
-            requests.RequestException: If a network error occurs.
-        """
-        cache_path = self.cache_dir / cache_filename
-
-        # 1. Check local cache first (Offline / Fast path)
-        if cache_path.exists() and not force_refresh:
-            logger.info("Loading cached data from %s", cache_path.name)
-            with open(cache_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-
-        # 2. Cache miss or forced refresh: execute network request
-        logger.info("Fetching fresh data from %s", url)
-        try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
-
-            # 3. Save to disk cache for future offline runs
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-
-            return data
-        except requests.RequestException as exc:
-            logger.error("Failed to fetch data from %s: %s", url, exc)
-            raise
-
-    # -----------------------------------------------------------------------
-    # Jolpica F1 API Methods (Ergast Continuation)
-    # -----------------------------------------------------------------------
-
-    def get_season_calendar(self, year: int, force_refresh: bool = False) -> Dict[str, Any]:
-        """Fetch the full Grand Prix schedule for a given season.
-
-        Args:
-            year: Formula 1 season (e.g. 2024).
-            force_refresh: If True, bypasses local cache.
-
-        Returns:
-            JSON response dictionary containing races list.
-        """
-        url = f"{JOLPICA_BASE_URL}/{year}.json"
-        filename = f"jolpica_{year}_calendar.json"
-        return self._fetch_with_cache(url, filename, force_refresh=force_refresh)
-
-    def get_race_results(
-        self, year: int, round_num: int, force_refresh: bool = False
-    ) -> Dict[str, Any]:
-        """Fetch final classification results for a specific Grand Prix.
-
-        Args:
-            year: Season year (e.g. 2024).
-            round_num: Race round number (e.g. 1 for Bahrain).
-            force_refresh: If True, bypasses local cache.
-
-        Returns:
-            JSON response dictionary containing race results.
-        """
-        url = f"{JOLPICA_BASE_URL}/{year}/{round_num}/results.json"
-        filename = f"jolpica_{year}_round_{round_num}_results.json"
-        return self._fetch_with_cache(url, filename, force_refresh=force_refresh)
-
-    def get_race_laps(
+    def _fetch_jolpica_paginated(
         self,
-        year: int,
-        round_num: int,
-        limit: int = 2000,
+        path: str,
+        list_key: str,
+        cache_filename: str,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """Fetch lap-by-lap timing data for all drivers in a race.
+        """Download every page of a Jolpica race-level endpoint and merge them.
 
-        Args:
-            year: Season year (e.g. 2024).
-            round_num: Race round number.
-            limit: Maximum number of records per request (default 2000 to cover all laps).
-            force_refresh: If True, bypasses local cache.
+        Jolpica returns at most 100 rows per request. ``MRData.total`` tells us
+        how many rows exist, so we request pages with increasing ``offset``.
 
-        Returns:
-            JSON response dictionary containing lap-by-lap timing.
+        For ``Laps`` a single lap's timings can be split across two pages, so
+        laps are merged by lap number. For ``PitStops`` pages are concatenated.
+
+        The merged result is cached only if the row count matches ``total``;
+        a cached file with too few rows is treated as invalid and re-downloaded.
         """
-        url = f"{JOLPICA_BASE_URL}/{year}/{round_num}/laps.json"
-        filename = f"jolpica_{year}_round_{round_num}_laps.json"
-        params = {"limit": limit}
-        return self._fetch_with_cache(url, filename, params=params, force_refresh=force_refresh)
+        cache_path = self.cache_dir / cache_filename
+        if not force_refresh:
+            cached = self._read_cache(cache_path)
+            if cached is not None and self._jolpica_is_complete(cached, list_key):
+                return cached
 
-    def get_pit_stops(
-        self, year: int, round_num: int, force_refresh: bool = False
-    ) -> Dict[str, Any]:
-        """Fetch all pit stops recorded during a race.
+        url = f"{JOLPICA_BASE_URL}/{path}.json"
+        offset, total = 0, None
+        first_page: Optional[Dict[str, Any]] = None
+        items: List[Dict[str, Any]] = []
 
-        Args:
-            year: Season year (e.g. 2024).
-            round_num: Race round number.
-            force_refresh: If True, bypasses local cache.
+        while total is None or offset < total:
+            page = self._get_json(url, {"limit": JOLPICA_PAGE_LIMIT, "offset": offset})
+            mr = page["MRData"]
+            total = int(mr["total"])
+            if first_page is None:
+                first_page = page
+            races = mr["RaceTable"]["Races"]
+            if races:
+                items.extend(races[0].get(list_key, []))
+            offset += JOLPICA_PAGE_LIMIT
+            if offset < total:
+                time.sleep(JOLPICA_PAGE_DELAY)
 
-        Returns:
-            JSON response dictionary containing pit stops list.
-        """
-        url = f"{JOLPICA_BASE_URL}/{year}/{round_num}/pitstops.json"
-        filename = f"jolpica_{year}_round_{round_num}_pitstops.json"
-        return self._fetch_with_cache(url, filename, force_refresh=force_refresh)
+        assert first_page is not None
+        if list_key == "Laps":
+            items = self._merge_lap_pages(items)
 
-    # -----------------------------------------------------------------------
-    # OpenF1 API Methods (Telemetry, Stints, Tyre Compounds)
-    # -----------------------------------------------------------------------
+        races = first_page["MRData"]["RaceTable"]["Races"]
+        if races:
+            races[0][list_key] = items
+        first_page["MRData"]["limit"] = str(total)
+        first_page["MRData"]["offset"] = "0"
 
-    def get_openf1_sessions(
-        self, year: int, country_name: Optional[str] = None, force_refresh: bool = False
-    ) -> List[Dict[str, Any]]:
-        """Fetch session keys and details from OpenF1.
+        if self._jolpica_is_complete(first_page, list_key):
+            self._write_cache(cache_path, first_page)
+        else:
+            logger.warning("Downloaded %s is incomplete; not caching it.", cache_filename)
+        return first_page
 
-        Args:
-            year: Season year (e.g. 2024).
-            country_name: Optional country filter (e.g. 'Bahrain').
-            force_refresh: If True, bypasses local cache.
+    @staticmethod
+    def _merge_lap_pages(laps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge lap entries that were split across pages (same lap number)."""
+        merged: Dict[int, Dict[str, Any]] = {}
+        for lap in laps:
+            n = int(lap["number"])
+            if n not in merged:
+                merged[n] = {"number": lap["number"], "Timings": []}
+            merged[n]["Timings"].extend(lap.get("Timings", []))
+        return [merged[n] for n in sorted(merged)]
 
-        Returns:
-            List of session records from OpenF1.
-        """
-        url = f"{OPENF1_BASE_URL}/sessions"
-        params: Dict[str, Any] = {"year": year}
-        if country_name:
-            params["country_name"] = country_name
-        
-        country_slug = country_name.lower().replace(" ", "_") if country_name else "all"
-        filename = f"openf1_{year}_{country_slug}_sessions.json"
-        return self._fetch_with_cache(url, filename, params=params, force_refresh=force_refresh)
+    @staticmethod
+    def _jolpica_is_complete(data: Dict[str, Any], list_key: str) -> bool:
+        """Check that the number of rows equals MRData.total."""
+        try:
+            mr = data["MRData"]
+            total = int(mr["total"])
+            races = mr["RaceTable"]["Races"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if total == 0:
+            return True
+        if not races:
+            return False
+        rows = races[0].get(list_key, [])
+        if list_key == "Laps":
+            count = sum(len(lap.get("Timings", [])) for lap in rows)
+        else:
+            count = len(rows)
+        return count == total
 
-    def get_openf1_stints(
-        self, session_key: int, force_refresh: bool = False
-    ) -> List[Dict[str, Any]]:
-        """Fetch tyre stints, compounds, and tyre age per driver from OpenF1.
+    # ------------------------------------------------------------------
+    # Jolpica endpoints
+    # ------------------------------------------------------------------
+    def get_season_calendar(self, year: int, force_refresh: bool = False) -> Dict[str, Any]:
+        """Season schedule (fewer than 30 races, so one page suffices)."""
+        return self._fetch_with_cache(
+            f"{JOLPICA_BASE_URL}/{year}.json",
+            f"jolpica_{year}_calendar.json",
+            params={"limit": JOLPICA_PAGE_LIMIT},
+            force_refresh=force_refresh,
+        )
 
-        Args:
-            session_key: OpenF1 unique session key.
-            force_refresh: If True, bypasses local cache.
+    def get_race_results(self, year: int, round_num: int, force_refresh: bool = False) -> Dict[str, Any]:
+        """Final classification of one race (at most ~24 rows, one page)."""
+        return self._fetch_with_cache(
+            f"{JOLPICA_BASE_URL}/{year}/{round_num}/results.json",
+            f"jolpica_{year}_round_{round_num}_results.json",
+            params={"limit": JOLPICA_PAGE_LIMIT},
+            force_refresh=force_refresh,
+        )
 
-        Returns:
-            List of tyre stint records.
-        """
-        url = f"{OPENF1_BASE_URL}/stints"
-        filename = f"openf1_session_{session_key}_stints.json"
-        params = {"session_key": session_key}
-        return self._fetch_with_cache(url, filename, params=params, force_refresh=force_refresh)
+    def get_race_laps(self, year: int, round_num: int, force_refresh: bool = False) -> Dict[str, Any]:
+        """Every lap timing of every driver (paginated, typically 1,000+ rows)."""
+        return self._fetch_jolpica_paginated(
+            f"{year}/{round_num}/laps", "Laps",
+            f"jolpica_{year}_round_{round_num}_laps.json", force_refresh,
+        )
 
-    def get_openf1_intervals(
-        self, session_key: int, force_refresh: bool = False
-    ) -> List[Dict[str, Any]]:
-        """Fetch lap-by-lap gap intervals to leader and ahead car.
+    def get_pit_stops(self, year: int, round_num: int, force_refresh: bool = False) -> Dict[str, Any]:
+        """Every pit stop of one race (paginated; can exceed 30 rows)."""
+        return self._fetch_jolpica_paginated(
+            f"{year}/{round_num}/pitstops", "PitStops",
+            f"jolpica_{year}_round_{round_num}_pitstops.json", force_refresh,
+        )
 
-        Args:
-            session_key: OpenF1 unique session key.
-            force_refresh: If True, bypasses local cache.
+    # ------------------------------------------------------------------
+    # OpenF1 endpoints (no pagination: full result per query)
+    # ------------------------------------------------------------------
+    def get_openf1_race_sessions(self, year: int, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """All race sessions (session_name == 'Race') of a season."""
+        return self._fetch_with_cache(
+            f"{OPENF1_BASE_URL}/sessions",
+            f"openf1_{year}_race_sessions.json",
+            params={"year": year, "session_name": "Race"},
+            force_refresh=force_refresh,
+        )
 
-        Returns:
-            List of interval records.
-        """
-        url = f"{OPENF1_BASE_URL}/intervals"
-        filename = f"openf1_session_{session_key}_intervals.json"
-        params = {"session_key": session_key}
-        return self._fetch_with_cache(url, filename, params=params, force_refresh=force_refresh)
+    def get_openf1_stints(self, session_key: int, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Tyre stints (compound, lap range, tyre age at start) for one session."""
+        return self._fetch_with_cache(
+            f"{OPENF1_BASE_URL}/stints",
+            f"openf1_session_{session_key}_stints.json",
+            params={"session_key": session_key},
+            force_refresh=force_refresh,
+        )

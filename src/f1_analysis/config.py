@@ -1,78 +1,71 @@
-"""Central configuration module for F1 Race Intelligence.
+"""Central configuration for F1 Race Intelligence.
 
-Defines filesystem paths, API endpoints, domain constants, and visualization
-palettes used throughout the project.
+Holds filesystem paths, API endpoints, modelling assumptions and colour palettes.
+Nothing here performs I/O at import time.
 """
 
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Filesystem Paths
+# Filesystem paths (resolved relative to this file, so they work on any OS)
+# src/f1_analysis/config.py -> parents[2] is the project root
 # ---------------------------------------------------------------------------
-# Resolves the project root directory dynamically from this file's location:
-# src/f1_analysis/config.py -> parent x 2 = project root
-PACKAGE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = PACKAGE_DIR.parent.parent
-
-# Data directories
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 
-# Notebooks and App directories
-NOTEBOOKS_DIR = PROJECT_ROOT / "notebooks"
-APP_DIR = PROJECT_ROOT / "app"
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
+JOLPICA_BASE_URL = "https://api.jolpi.ca/ergast/f1"   # Ergast-compatible API
+OPENF1_BASE_URL = "https://api.openf1.org/v1"         # data available from 2023
 
-# Ensure data directories exist
-RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
+DEFAULT_TIMEOUT = 25            # seconds per HTTP request
+JOLPICA_PAGE_LIMIT = 100        # Jolpica caps `limit` at 100 rows per request
+JOLPICA_PAGE_DELAY = 0.3        # seconds between pages (Jolpica burst limit is 4 req/s)
 
 # ---------------------------------------------------------------------------
-# API Endpoints
+# Modelling assumptions (NOT measured data - documented so they can be challenged)
 # ---------------------------------------------------------------------------
-# Jolpica F1 API (Modern community continuation of Ergast API)
-# Official documentation: https://api.jolpi.ca/ergast/f1/
-JOLPICA_BASE_URL = "https://api.jolpi.ca/ergast/f1"
+# Fuel effect: a commonly cited engineering rule of thumb is ~0.03 s of lap time
+# per kg of fuel. Cars may start with at most 110 kg (FIA regs); 100 kg is a
+# typical race start load. Fuel burned per lap is derived from the race distance
+# in the data (START_FUEL_KG / total laps), so it is not hardcoded per race.
+FUEL_EFFECT_SEC_PER_KG = 0.03
+START_FUEL_KG = 100.0
 
-# OpenF1 API (High-resolution telemetry and session data)
-# Official documentation: https://openf1.org/
-OPENF1_BASE_URL = "https://api.openf1.org/v1"
+# A lap slower than (driver median * factor) is treated as non-representative.
+SLOW_LAP_THRESHOLD_FACTOR = 1.07
 
-# Default network request timeout (in seconds)
-DEFAULT_TIMEOUT = 25
-
+# A pit-lane time greater than (race median * factor) is flagged as anomalous
+# (typically red-flag stops or long repairs).
+PIT_OUTLIER_FACTOR = 2.0
 
 # ---------------------------------------------------------------------------
-# Formula 1 Domain & Physics Constants
+# Colour palettes
 # ---------------------------------------------------------------------------
-# Fuel load effect approximation:
-# F1 cars start with ~100-110 kg of fuel. As fuel burns off, cars gain ~0.035s per lap per kg burned.
-# Across a ~55-lap race, lap times naturally drop by ~1.5 - 2.2 seconds solely due to mass reduction.
-ESTIMATED_FUEL_CORRECTION_SEC_PER_LAP = 0.035
-
-# Standard Tyre Compound Visual Palette (FIA standard color scheme)
 COMPOUND_COLORS = {
-    "SOFT": "#FF1801",        # Red
-    "MEDIUM": "#FFD700",      # Yellow
-    "HARD": "#FFFFFF",        # White
-    "INTERMEDIATE": "#00D2BE", # Green
-    "WET": "#007FFF",         # Blue
-    "UNKNOWN": "#808080",     # Grey
+    "SOFT": "#FF1801",
+    "MEDIUM": "#FFD700",
+    "HARD": "#F0F0F0",
+    "INTERMEDIATE": "#39B54A",
+    "WET": "#0067AD",
+    "UNKNOWN": "#808080",
 }
 
-# Standard Constructor Visual Palette (2023-2024 season references)
+# Keys are matched as case-insensitive substrings of Jolpica constructor names.
 CONSTRUCTOR_COLORS = {
-    "Red Bull": "#3671C6",
-    "Ferrari": "#E80020",
-    "Mercedes": "#27F4D2",
-    "McLaren": "#FF8000",
-    "Aston Martin": "#229971",
-    "Alpine": "#0093CC",
-    "Williams": "#64C4FF",
-    "AlphaTauri": "#5E8FAA",
-    "RB": "#6692FF",
-    "Alfa Romeo": "#C92D4B",
-    "Sauber": "#52E252",
-    "Haas": "#B6BABD",
+    "red bull": "#3671C6",
+    "ferrari": "#E80020",
+    "mercedes": "#27F4D2",
+    "mclaren": "#FF8000",
+    "aston martin": "#229971",
+    "alpine": "#0093CC",
+    "williams": "#64C4FF",
+    "alphatauri": "#5E8FAA",
+    "rb f1": "#6692FF",
+    "alfa romeo": "#C92D4B",
+    "sauber": "#52E252",
+    "haas": "#B6BABD",
 }
