@@ -1,40 +1,46 @@
-"""Unit tests for tyre degradation regression analysis."""
+"""Tests for the within-stint tyre degradation estimator."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.f1_analysis.analysis.tyre_analysis import compute_compound_degradation, _fit_linear_regression
+from f1_analysis.analysis.tyre_analysis import compute_compound_degradation, compute_driver_stint_summary
 
 
-def test_fit_linear_regression():
-    """Verify OLS linear regression calculations."""
-    x = np.array([1, 2, 3, 4, 5], dtype=float)
-    # y = 100 + 0.1 * x
-    y = 100.0 + 0.1 * x
-
-    fit = _fit_linear_regression(x, y)
-    assert fit["intercept"] == pytest.approx(100.0)
-    assert fit["slope"] == pytest.approx(0.1)
-    assert fit["r_squared"] == pytest.approx(1.0)
+def _stint(driver, stint, compound, base, slope, n=8):
+    age = np.arange(1, n + 1)
+    return pd.DataFrame({"driver_id": driver, "stint_number": stint, "compound": compound,
+                         "tyre_age": age, "lap_number": age + 10 * stint,
+                         "lap_time_sec": base + slope * age})
 
 
-def test_compute_compound_degradation():
-    """Verify compound degradation slope calculation across compounds."""
-    df = pd.DataFrame({
-        "compound": ["SOFT"] * 10 + ["HARD"] * 10,
-        "tyre_age": list(range(1, 11)) * 2,
-        # Soft degrades faster (+0.2s/lap), Hard degrades slower (+0.05s/lap)
-        "lap_time_sec": [88.0 + 0.2 * i for i in range(1, 11)] + [90.0 + 0.05 * i for i in range(1, 11)],
-        "fuel_corrected_lap_sec": [88.0 + 0.2 * i for i in range(1, 11)] + [90.0 + 0.05 * i for i in range(1, 11)],
-        "is_valid_representative_lap": [True] * 20,
-    })
+def test_within_stint_slope_is_not_confounded_by_car_pace():
+    # Fast car on old tyres, slow car on new tyres: a pooled regression would
+    # produce a NEGATIVE slope. The true degradation is +0.1 s/lap for both.
+    fast = _stint("fast", 1, "HARD", base=88.0, slope=0.1)
+    fast["tyre_age"] += 15
+    slow = _stint("slow", 1, "HARD", base=92.0, slope=0.1)
+    df = pd.concat([fast, slow], ignore_index=True)
+    df["lap_time_sec"] = df.groupby("driver_id")["lap_time_sec"].transform(lambda s: s)  # unchanged
+    deg = compute_compound_degradation(df, use_fuel_corrected=False)
+    assert deg.loc[0, "degradation_sec_per_lap"] == pytest.approx(0.1)
+    assert deg.loc[0, "n_stints"] == 2
 
-    deg = compute_compound_degradation(df, min_stint_laps=5, use_fuel_corrected=True)
-    assert len(deg) == 2
-    soft_row = deg[deg["compound"] == "SOFT"].iloc[0]
-    hard_row = deg[deg["compound"] == "HARD"].iloc[0]
 
-    assert soft_row["degradation_slope_sec_per_lap"] == pytest.approx(0.2)
-    assert hard_row["degradation_slope_sec_per_lap"] == pytest.approx(0.05)
-    assert soft_row["r_squared"] == pytest.approx(1.0)
+def test_compounds_estimated_separately():
+    df = pd.concat([_stint("a", 1, "SOFT", 88, 0.2), _stint("a", 2, "HARD", 90, 0.05)], ignore_index=True)
+    deg = compute_compound_degradation(df, use_fuel_corrected=False).set_index("compound")
+    assert deg.loc["SOFT", "degradation_sec_per_lap"] == pytest.approx(0.2)
+    assert deg.loc["HARD", "degradation_sec_per_lap"] == pytest.approx(0.05)
+
+
+def test_short_stints_and_unknown_compound_excluded():
+    df = pd.concat([_stint("a", 1, "SOFT", 88, 0.2, n=3), _stint("b", 1, np.nan, 88, 0.2)], ignore_index=True)
+    assert compute_compound_degradation(df, min_stint_laps=5).empty
+
+
+def test_stint_summary():
+    df = pd.concat([_stint("a", 1, "SOFT", 88, 0.2), _stint("a", 2, "HARD", 90, 0.05)], ignore_index=True)
+    s = compute_driver_stint_summary(df, use_fuel_corrected=False)
+    assert s["stint_length_laps"].tolist() == [8, 8]
+    assert s["degradation_sec_per_lap"].tolist() == pytest.approx([0.2, 0.05])

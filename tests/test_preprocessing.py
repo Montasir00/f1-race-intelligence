@@ -1,48 +1,83 @@
-"""Unit tests for data loader utilities and preprocessing pipelines."""
+"""Tests for parsing helpers and the preprocessing pipeline."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.f1_analysis.data.data_loader import time_to_seconds
-from src.f1_analysis.data.preprocessing import clean_lap_times, apply_fuel_correction, merge_laps_with_stints
+from f1_analysis.data.data_loader import time_to_seconds
+from f1_analysis.data.preprocessing import (
+    apply_fuel_correction,
+    clean_lap_times,
+    flag_pit_laps,
+    merge_laps_with_stints,
+)
 
 
-def test_time_to_seconds():
-    """Verify conversion of F1 timing strings to float seconds."""
-    assert time_to_seconds("1:32.408") == pytest.approx(92.408)
-    assert time_to_seconds("24.512") == pytest.approx(24.512)
-    assert time_to_seconds("1:20:15.500") == pytest.approx(4815.5)
-    assert time_to_seconds(None) is None
-    assert time_to_seconds("") is None
-    assert time_to_seconds("invalid") is None
+@pytest.mark.parametrize("text, expected", [
+    ("1:32.408", 92.408), ("24.512", 24.512), ("1:20:15.500", 4815.5),
+    (None, None), ("", None), ("invalid", None), ("1:2:3:4", None),
+])
+def test_time_to_seconds(text, expected):
+    result = time_to_seconds(text)
+    assert result == (pytest.approx(expected) if expected is not None else None)
 
 
-def test_clean_lap_times_filters_outliers():
-    """Verify that slow laps (e.g., pit entry, safety car) are flagged as non-representative."""
-    df = pd.DataFrame({
-        "driver_id": ["verstappen"] * 5,
-        "lap_number": [1, 2, 3, 4, 5],
-        "lap_time_sec": [90.0, 90.2, 130.0, 90.1, 90.3],  # Lap 3 is +44% slower
+def _laps():
+    return pd.DataFrame({
+        "driver_id": ["ver"] * 6,
+        "lap_number": [1, 2, 3, 4, 5, 6],
+        "lap_time_sec": [98.0, 90.0, 90.2, 112.0, 90.1, np.nan],
     })
 
-    cleaned = clean_lap_times(df, threshold_factor=1.15)
-    assert "is_valid_representative_lap" in cleaned.columns
-    # Laps 1, 2, 4, 5 should be valid; lap 3 should be flagged False
-    assert cleaned.loc[cleaned["lap_number"] == 3, "is_valid_representative_lap"].values[0] == False
-    assert cleaned.loc[cleaned["lap_number"] == 1, "is_valid_representative_lap"].values[0] == True
+
+def test_flag_pit_laps():
+    pits = pd.DataFrame({"driver_id": ["ver"], "lap": [3]})
+    df = flag_pit_laps(_laps(), pits)
+    assert df.loc[df.lap_number == 3, "is_pit_in_lap"].item()
+    assert df.loc[df.lap_number == 4, "is_pit_out_lap"].item()
+    assert df["is_pit_in_lap"].sum() == 1 and df["is_pit_out_lap"].sum() == 1
 
 
-def test_apply_fuel_correction():
-    """Verify fuel load mass correction math."""
-    df = pd.DataFrame({
-        "driver_id": ["leclerc", "leclerc"],
-        "lap_number": [1, 2],
-        "lap_time_sec": [90.0, 90.0],
-    })
+def test_clean_lap_times_reasons_and_keeps_rows():
+    pits = pd.DataFrame({"driver_id": ["ver"], "lap": [3]})
+    df = clean_lap_times(flag_pit_laps(_laps(), pits))
+    assert len(df) == 6                                   # nothing deleted
+    reasons = df.set_index("lap_number")["exclusion_reason"]
+    assert reasons[1] == "first_lap"
+    assert reasons[3] == "pit_in_lap"
+    assert reasons[4] == "pit_out_lap"
+    assert reasons[6] == "missing_time"
+    assert df.set_index("lap_number").loc[[2, 5], "is_valid_representative_lap"].all()
 
-    corrected = apply_fuel_correction(df, correction_per_lap=0.035)
-    # Lap 1: 90.0 + (1-1)*0.035 = 90.0
-    # Lap 2: 90.0 + (2-1)*0.035 = 90.035
-    assert corrected.loc[0, "fuel_corrected_lap_sec"] == pytest.approx(90.0)
-    assert corrected.loc[1, "fuel_corrected_lap_sec"] == pytest.approx(90.035)
+
+def test_clean_lap_times_flags_slow_lap():
+    df = pd.DataFrame({"driver_id": ["a"] * 5, "lap_number": [2, 3, 4, 5, 6],
+                       "lap_time_sec": [90.0, 90.1, 130.0, 90.2, 90.0]})
+    out = clean_lap_times(df)
+    assert out.loc[out.lap_number == 4, "exclusion_reason"].item() == "slow_lap"
+
+
+def test_fuel_correction_uses_race_distance():
+    df = pd.DataFrame({"lap_number": [1, 2, 50], "lap_time_sec": [90.0, 90.0, 90.0]})
+    out = apply_fuel_correction(df, fuel_effect_sec_per_kg=0.03, start_fuel_kg=100.0)
+    per_lap = 0.03 * 100.0 / 50                           # 0.06 s/lap
+    assert out["fuel_corrected_lap_sec"].tolist() == pytest.approx([90.0, 90.0 + per_lap, 90.0 + 49 * per_lap])
+
+
+def test_merge_laps_with_stints(results, stints):
+    laps = pd.DataFrame({"driver_id": ["ver"] * 6 + ["lec"], "lap_number": [1, 2, 3, 4, 5, 6, 1]})
+    out = merge_laps_with_stints(laps, stints, results)
+    ver = out[out.driver_id == "ver"].set_index("lap_number")
+    assert ver.loc[1, "compound"] == "SOFT" and ver.loc[1, "tyre_age"] == 1
+    assert ver.loc[3, "tyre_age"] == 3
+    assert ver.loc[4, "compound"] == "HARD" and ver.loc[4, "tyre_age"] == 3  # used set: age 2 at start
+    assert ver.loc[6, "compound"] == "HARD"                                  # open-ended last stint
+    lec = out[out.driver_id == "lec"]
+    assert lec["compound"].isna().all() and lec["tyre_age"].isna().all()     # no invented values
+    assert len(out) == len(laps)
+
+
+def test_merge_without_stints_leaves_nan(results):
+    laps = pd.DataFrame({"driver_id": ["ver"], "lap_number": [1]})
+    out = merge_laps_with_stints(laps, pd.DataFrame(), results)
+    assert out["compound"].isna().all() and out["tyre_age"].isna().all()
